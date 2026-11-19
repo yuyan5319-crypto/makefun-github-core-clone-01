@@ -373,25 +373,19 @@ function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buff
       return null;
     }
   };
-  let lo = off + 1;
+  // Exponential phase: find an upper bound that inflates (or the buffer end).
   let hi = buf.length;
-  let found: { data: Buffer; next: number } | null = null;
-  // First, grow exponentially to bound the search.
   let probe = off + 16;
   while (probe < hi) {
-    const data = tryEnd(probe);
-    if (data !== null) {
+    if (tryEnd(probe) !== null) {
       hi = probe;
-      found = { data, next: probe };
       break;
     }
     probe = Math.min(hi, probe * 2);
   }
-  if (found === null) {
-    const data = tryEnd(hi);
-    if (data === null) throw new Error('corrupt zlib stream in pack');
-    return { data, next: hi };
-  }
+  // Binary search for the smallest end that inflates to the declared size.
+  let lo = off + 1;
+  let found: { data: Buffer; next: number } | null = null;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     const data = tryEnd(mid);
@@ -402,6 +396,7 @@ function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buff
       lo = mid + 1;
     }
   }
+  if (found === null) throw new Error('corrupt zlib stream in pack');
   return found;
 }
 
@@ -1994,6 +1989,11 @@ const SCHEMA_FIELDS: Record<string, string[]> = {
   IssueComment: ['id', 'body'],
   Query: ['viewer', 'repository', 'node', '__type', '__schema'],
   Mutation: ['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment'],
+  __Type: ['name', 'kind', 'fields', 'enumValues', 'description'],
+  __Schema: ['types', 'queryType', 'mutationType', 'description'],
+  __Field: ['name', 'description', 'args', 'type'],
+  __EnumValue: ['name', 'description'],
+  __InputValue: ['name', 'description', 'type'],
 };
 
 const SCHEMA_ENUMS: Record<string, string[]> = {
@@ -2010,7 +2010,7 @@ function typeInfoObject(name: string): Record<string, unknown> | null {
       __typename: '__Type',
       name,
       kind: 'OBJECT',
-      fields: SCHEMA_FIELDS[name].map((f) => ({ name: f, description: null, args: [], type: { name: 'String', kind: 'SCALAR' } })),
+      fields: SCHEMA_FIELDS[name].map((f) => ({ __typename: '__Field', name: f, description: null, args: [], type: { __typename: '__Type', name: 'String', kind: 'SCALAR' } })),
       enumValues: null,
     };
   }
@@ -2020,7 +2020,7 @@ function typeInfoObject(name: string): Record<string, unknown> | null {
       name,
       kind: 'ENUM',
       fields: null,
-      enumValues: (SCHEMA_ENUMS[name] as string[]).map((v) => ({ name: v, description: null })),
+      enumValues: (SCHEMA_ENUMS[name] as string[]).map((v) => ({ __typename: '__EnumValue', name: v, description: null })),
     };
   }
   return null;
@@ -2156,10 +2156,15 @@ function executeSelections(
       continue;
     }
     if (sel.selections !== undefined && value !== null && typeof value === 'object') {
-      const childType = (value as GqlParent).__typename as string;
       if (Array.isArray(value)) {
-        data[outName] = value;
+        data[outName] = value.map((item) => {
+          if (item !== null && typeof item === 'object' && (item as GqlParent).__typename !== undefined) {
+            return executeSelections(sel.selections as SelectionNode[], (item as GqlParent).__typename as string, item as GqlParent, variables, fragments, errors);
+          }
+          return item;
+        });
       } else {
+        const childType = (value as GqlParent).__typename as string;
         data[outName] = executeSelections(sel.selections, childType, value as GqlParent, variables, fragments, errors);
       }
     } else {
@@ -2220,8 +2225,8 @@ function resolveGqlField(
     if (fieldName === '__schema') {
       return {
         __typename: '__Schema',
-        queryType: { name: 'Query' },
-        mutationType: { name: 'Mutation' },
+        queryType: { __typename: '__Type', name: 'Query' },
+        mutationType: { __typename: '__Type', name: 'Mutation' },
         types: Object.keys(SCHEMA_FIELDS).map((name) => typeInfoObject(name)),
       };
     }
@@ -2775,18 +2780,8 @@ function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(chunks);
 }
 
-function buildPack(repo: Repo, objects: Map<string, GitObject>): Buffer {
-  const entries: Buffer[] = [];
-  for (const [oid, obj] of objects) {
-    entries.push(writePackObject(obj));
-  }
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(entries.length, 8);
-  const body = Buffer.concat([header, ...entries]);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+function buildPack(_repo: Repo, objects: Map<string, GitObject>): Buffer {
+  return writePack([...objects.values()]);
 }
 
 /** Parse a v2 ls-refs / fetch request body into commands and arguments. */
@@ -2917,30 +2912,32 @@ function isFastForward(repo: Repo, oldTip: string, newTip: string): boolean {
 
 async function handleReceivePack(req: http.IncomingMessage, res: http.ServerResponse, repo: Repo): Promise<void> {
   const body = await readBody(req);
-  const { packets } = parsePktLines(body);
   interface Command {
     oldOid: string;
     newOid: string;
     ref: string;
   }
   const commands: Command[] = [];
+  // Walk the command pkt-lines manually: after the flush packet the rest of
+  // the body is raw pack bytes, not pkt-lines.
   let packStart = -1;
-  let byteOff = 0;
-  for (let i = 0; i < packets.length; i += 1) {
-    const p = packets[i] as (typeof packets)[number];
-    const pktLen = p.kind === 'data' ? 4 + p.payload.length : 4;
-    byteOff += pktLen;
-    if (p.kind === 'flush') {
-      packStart = byteOff;
+  let off = 0;
+  while (off + 4 <= body.length) {
+    const head = body.subarray(off, off + 4).toString('ascii');
+    if (!/^[0-9a-f]{4}$/.test(head)) throw new HttpError(400, 'Invalid pkt-line framing');
+    const len = parseInt(head, 16);
+    if (len === 0) {
+      off += 4;
+      packStart = off;
       break;
     }
-    if (p.kind === 'data') {
-      const text = p.payload.toString('utf8').trim();
-      const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)(?:\0.*)?$/.exec(text);
-      if (m !== null) {
-        commands.push({ oldOid: m[1] as string, newOid: m[2] as string, ref: m[3] as string });
-      }
+    if (len < 4 || off + len > body.length) throw new HttpError(400, 'Invalid pkt-line framing');
+    const text = body.subarray(off + 4, off + len).toString('utf8').trim();
+    const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)(?:\0.*)?$/.exec(text);
+    if (m !== null) {
+      commands.push({ oldOid: m[1] as string, newOid: m[2] as string, ref: m[3] as string });
     }
+    off += len;
   }
   if (packStart === -1) packStart = body.length;
   const packBytes = body.subarray(packStart);
@@ -2948,11 +2945,18 @@ async function handleReceivePack(req: http.IncomingMessage, res: http.ServerResp
   if (packBytes.length > 0) {
     try {
       packObjects = readPack(packBytes, (oid) => repo.objects.get(oid));
-    } catch {
+    } catch (err) {
+      console.error('readPack failed:', err instanceof Error ? err.message : err);
       return sendError(res, 400, 'Invalid packfile');
     }
   }
-  // Validate all commands before mutating anything.
+  // Store the pack objects first: validation (fast-forward checks) walks the
+  // object graph, so the new objects must already be in the store. They are
+  // unreachable until the refs below move, exactly like a real receive-pack.
+  if (packObjects !== null) {
+    for (const [oid, obj] of packObjects) repo.objects.set(oid, obj);
+  }
+  // Validate all commands before mutating any refs.
   const results: Array<{ ref: string; ok: boolean; reason?: string }> = [];
   for (const cmd of commands) {
     const current = repo.refs.get(cmd.ref);
@@ -2982,10 +2986,7 @@ async function handleReceivePack(req: http.IncomingMessage, res: http.ServerResp
     }
     results.push({ ref: cmd.ref, ok: true });
   }
-  // Apply: store objects first, then move accepted refs.
-  if (packObjects !== null) {
-    for (const [oid, obj] of packObjects) repo.objects.set(oid, obj);
-  }
+  // Apply: move accepted refs.
   for (let i = 0; i < commands.length; i += 1) {
     const cmd = commands[i] as Command;
     const result = results[i] as { ref: string; ok: boolean };
@@ -2997,6 +2998,7 @@ async function handleReceivePack(req: http.IncomingMessage, res: http.ServerResp
   for (const result of results) {
     inner.push(result.ok ? pktLine(`ok ${result.ref}\n`) : pktLine(`ng ${result.ref} ${result.reason ?? 'rejected'}\n`));
   }
+  inner.push(PKT_FLUSH);
   const out = pktLine(Buffer.concat([Buffer.from([1]), Buffer.concat(inner)]));
   sendRaw(res, 200, 'application/x-git-receive-pack-result', Buffer.concat([out, PKT_FLUSH]));
 }
@@ -3063,18 +3065,22 @@ async function dispatch(req: http.IncomingMessage, res: http.ServerResponse): Pr
     }
     if (path === '/api/graphql') {
       if (!checkAuth(req, res)) return;
-      return handleGraphQL(req, res);
+      await handleGraphQL(req, res);
+      return;
     }
     if (path === '/mcp') {
       if (!checkAuth(req, res)) return;
-      return handleMcp(req, res);
+      await handleMcp(req, res);
+      return;
     }
     if (path === '/api/v3' || path.startsWith('/api/v3/')) {
       if (!checkAuth(req, res)) return;
-      return handleRest(req, res, url);
+      await handleRest(req, res, url);
+      return;
     }
     if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
-      return handleGit(req, res, url);
+      await handleGit(req, res, url);
+      return;
     }
     return sendError(res, 404, 'Not Found');
   } catch (err) {
