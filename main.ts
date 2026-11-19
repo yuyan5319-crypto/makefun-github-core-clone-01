@@ -376,16 +376,20 @@ function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buff
   // Exponential phase: find an upper bound that inflates (or the buffer end).
   let hi = buf.length;
   let probe = off + 16;
+  let found: { data: Buffer; next: number } | null = null;
   while (probe < hi) {
-    if (tryEnd(probe) !== null) {
+    const data = tryEnd(probe);
+    if (data !== null) {
       hi = probe;
+      found = { data, next: probe };
       break;
     }
     probe = Math.min(hi, probe * 2);
   }
   // Binary search for the smallest end that inflates to the declared size.
+  // (If the true end is exactly the exponential bound, no mid ever succeeds
+  // and `found` keeps the exponential-phase result.)
   let lo = off + 1;
-  let found: { data: Buffer; next: number } | null = null;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     const data = tryEnd(mid);
@@ -716,9 +720,8 @@ function fetchSelection(
       held.add(have);
       if (obj.type === 'commit') {
         const view = parseCommit(obj.data);
-        const flat = flattenTree(repo, view.tree);
-        held.add(view.tree);
-        for (const v of flat.values()) held.add(v.oid);
+        // Leaf: the commit plus its full tree closure (trees and blobs).
+        for (const oid of collectReachable(repo, [view.tree])) held.add(oid);
       }
     } else {
       for (const oid of collectReachable(repo, [have])) held.add(oid);
@@ -758,8 +761,8 @@ function fetchSelection(
     included.add(oid);
     includedCommits.add(oid);
     const view = parseCommit(obj.data);
-    included.add(view.tree);
-    for (const v of flattenTree(repo, view.tree).values()) included.add(v.oid);
+    // The commit's whole tree closure: root tree, nested trees, and blobs.
+    for (const treeOid of collectReachable(repo, [view.tree])) included.add(treeOid);
     for (const parent of view.parents) queue.push({ oid: parent, gen: gen + 1 });
   }
   const send = new Map<string, GitObject>();
@@ -1230,7 +1233,8 @@ async function handleRepoSub(
     if (tip === undefined) return sendJson(res, 200, []);
     const commits = walkCommits(repo, tip).map((oid) => {
       const view = parseCommit(repo.objects.get(oid)?.data ?? Buffer.alloc(0));
-      return { sha: oid, commit: { message: view.message } };
+      // GitHub strips the trailing newline from commit messages.
+      return { sha: oid, commit: { message: view.message.replace(/\n+$/, '') } };
     });
     const { page, link } = paginate(commits, url.searchParams, origin);
     return sendJson(res, 200, page, link === '' ? {} : { link });
