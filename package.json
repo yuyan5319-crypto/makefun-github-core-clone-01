@@ -1,0 +1,12 @@
+{
+  "name": "makefun-github-core-clone-01",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A single-file, dependency-free GitHub-compatible git forge in TypeScript for Node 22.",
+  "license": "MIT",
+  "type": "module",
+  "main": "main.ts",
+  "scripts": {
+    "start": "node main.ts"
+  }
+}
