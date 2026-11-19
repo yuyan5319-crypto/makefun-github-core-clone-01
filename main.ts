@@ -2796,8 +2796,8 @@ interface V2Request {
   delimSeen: boolean;
 }
 function parseV2Request(body: Buffer): V2Request {
-  const packets = parsePktLines(body);
-  const commandLine = packets.find((p) => p.kind === 'data')?.text ?? '';
+  const { packets } = parsePktLines(body);
+  const commandLine = (packets.find((p) => p.kind === 'data')?.payload.toString('utf8') ?? '').trim();
   const args: string[] = [];
   let delimSeen = false;
   for (const p of packets) {
@@ -2806,7 +2806,7 @@ function parseV2Request(body: Buffer): V2Request {
       continue;
     }
     if (p.kind !== 'data') continue;
-    const text = p.text;
+    const text = p.payload.toString('utf8').trim();
     if (text === commandLine) continue;
     if (text.startsWith('agent=') || text.startsWith('object-format=')) continue;
     args.push(text);
@@ -2819,14 +2819,14 @@ function handleLsRefs(repo: Repo | undefined, body: Buffer): Buffer {
   const wantPeel = req.args.includes('peel');
   const wantSymrefs = req.args.includes('symrefs');
   const wantUnborn = req.args.includes('unborn');
-  const prefixArg = req.args.find((a) => a.startsWith('ref-prefix '));
-  const prefix = prefixArg === undefined ? undefined : prefixArg.slice('ref-prefix '.length);
+  const prefixes = req.args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice('ref-prefix '.length));
+  const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
   const chunks: Buffer[] = [];
   const refs = repo === undefined ? [] : [...repo.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   const emit = (oid: string, name: string, extra = ''): void => {
     chunks.push(pktLine(`${oid} ${name}${extra}\n`));
   };
-  if (prefix === undefined) {
+  if (matches('HEAD')) {
     const headTarget = `refs/heads/${DEFAULT_BRANCH}`;
     const headOid = repo?.refs.get(headTarget);
     if (headOid !== undefined) {
@@ -2836,13 +2836,10 @@ function handleLsRefs(repo: Repo | undefined, body: Buffer): Buffer {
     }
   }
   for (const [ref, oid] of refs) {
-    if (prefix !== undefined && !ref.startsWith(prefix)) continue;
+    if (!matches(ref)) continue;
     let extra = '';
     const obj = repo?.objects.get(oid);
     if (wantPeel && obj?.type === 'tag') extra += ` peeled:${parseTag(obj.data).object}`;
-    if (wantSymrefs && ref === `refs/heads/${DEFAULT_BRANCH}`) {
-      // HEAD symref is only advertised on the HEAD line; skip here.
-    }
     emit(oid, ref, extra);
   }
   chunks.push(PKT_FLUSH);
@@ -2883,14 +2880,14 @@ function handleFetchV2(repo: Repo, body: Buffer): Buffer {
 }
 
 function handleFetchV0(repo: Repo, body: Buffer): Buffer {
-  const packets = parsePktLines(body);
+  const { packets } = parsePktLines(body);
   const wants: string[] = [];
   const haves: string[] = [];
   let depth: number | undefined;
   let first = true;
   for (const p of packets) {
     if (p.kind !== 'data') continue;
-    const text = p.text;
+    const text = p.payload.toString('utf8');
     if (text.startsWith('want ')) {
       wants.push(text.slice(5).split(' ')[0] as string);
       first = false;
@@ -2920,7 +2917,7 @@ function isFastForward(repo: Repo, oldTip: string, newTip: string): boolean {
 
 async function handleReceivePack(req: http.IncomingMessage, res: http.ServerResponse, repo: Repo): Promise<void> {
   const body = await readBody(req);
-  const packets = parsePktLines(body);
+  const { packets } = parsePktLines(body);
   interface Command {
     oldOid: string;
     newOid: string;
@@ -2928,14 +2925,17 @@ async function handleReceivePack(req: http.IncomingMessage, res: http.ServerResp
   }
   const commands: Command[] = [];
   let packStart = -1;
+  let byteOff = 0;
   for (let i = 0; i < packets.length; i += 1) {
     const p = packets[i] as (typeof packets)[number];
+    const pktLen = p.kind === 'data' ? 4 + p.payload.length : 4;
+    byteOff += pktLen;
     if (p.kind === 'flush') {
-      packStart = p.end;
+      packStart = byteOff;
       break;
     }
     if (p.kind === 'data') {
-      const text = p.text;
+      const text = p.payload.toString('utf8').trim();
       const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)(?:\0.*)?$/.exec(text);
       if (m !== null) {
         commands.push({ oldOid: m[1] as string, newOid: m[2] as string, ref: m[3] as string });
@@ -3085,7 +3085,10 @@ async function dispatch(req: http.IncomingMessage, res: http.ServerResponse): Pr
 }
 
 const server = http.createServer((req, res) => {
-  void dispatch(req, res);
+  dispatch(req, res).catch((err) => {
+    console.error('dispatch error:', err);
+    if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+  });
 });
 
 async function fetchJson(url: string, init: { method?: string; body?: string; headers?: Record<string, string> }): Promise<{ status: number; text: string }> {
